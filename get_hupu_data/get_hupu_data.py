@@ -8,7 +8,7 @@ import logging
 import os
 import pymysql
 import redis
-from get_weibo_detail import get_detail
+from get_hupu_detail import get_detail
 import re
 import traceback
 from elasticsearch import Elasticsearch
@@ -36,7 +36,7 @@ def set_log(filename='logfile'):
     return logger
 
 
-logger = set_log("weibo_log")
+logger = set_log("hupu_log")
 mysql_host = ""
 redis_host = ""
 es_host = ""
@@ -59,49 +59,64 @@ def get_html(url, headers):
 
 def write_to_db(html):
     soup = BeautifulSoup(html, 'html.parser')
-    html_start = "https://s.weibo.com"
-    hot = soup.find_all(class_='td-02')
-    index = 1
+    # 需要爬取的内容所属class
+    all_topic = soup.find_all(class_="textSpan")
+    # 一共是20条，后面的热榜内容舍去
+    main_topic = all_topic[:20]
     date = []
     es_datas = []
-    for i in hot[1:]:
+    index = 1
+    for topic in main_topic:
         rank = index
         # print(rank)
-        each_title = i.a.get_text().strip()
+        # 得到标题
+        each_title = topic.a.get("title")
         # print(each_title)
-        href = i.a.get('href')
-        if not href.startswith("/weibo?"):
-            href = i.a.get('href_to')
-        href = html_start + href
+        # 得到链接，链接不完整时需要补充
+        href = "https://bbs.hupu.com" + topic.a.get("href")
         # print(href)
+        # 得到需要计算热度的文本
+        hot_number_str = topic.em.get_text().strip()
+        index_l = hot_number_str.find("亮")
+        index_h = hot_number_str.find("回复")
+        # 计算得到热度
+        ln = 0
+        hn = 0
+        if index_l >= 0:
+            ln = int(hot_number_str[:index_l])
+        if index_h >= 0:
+            if index_l >= 0:
+                hn = int(hot_number_str[index_l + 1:index_h])
+            else:
+                hn = int(hot_number_str[:index_h])
+        hot_number = ln+hn
+        # print(hot_number)
         public, detail = get_detail(href)
         # print(public)
         # print(detail)
-        hot_number = int(i.span.get_text())
-        # print(hot_number)
         # 外键
         t = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))
-        u_id = int(str(index) + t[::3][1:])
-        # 获取当前时间作为爬取的信息时间
+        u_id = int(str(rank) + t[::3][1:])
+        # print(u_id)
         date.append((int(rank), each_title, href, public, int(hot_number), detail, t, int(u_id)))
         es_datas.append([each_title, each_title, int(rank), int(hot_number), t.replace(" ", 'T'), int(u_id)])
-        index = index + 1
+        index += 1
         time.sleep(1)
     try:
         db = pymysql.connect(mysql_host, "root", "0", "social_network_data")
         cursor = db.cursor()
         try:
-            cursor.executemany('insert into weibo_hot_list(rank, title, link, public_name, hot_number, detail, '
+            cursor.executemany('insert into hupu_hot_list(rank, title, link, public_name, hot_number, detail, '
                                'timestamp, u_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)', date)
             db.commit()
-            logger.info("微博热榜写入数据库完成")
+            logger.info("虎扑写入数据库完成")
             r = redis.StrictRedis(host=redis_host, port='6379', password='0')
             try:
-                if r.exists('HotSpotData::weibo'):
-                    r.delete('HotSpotData::weibo')
-                logger.info("微博清除redis完成")
+                if r.exists('HotSpotData::hupu'):
+                    r.delete('HotSpotData::hupu')
+                logger.info("虎扑清除redis完成")
             except Exception as e:
-                logger.error("微博清除redis错误" + str(e))
+                logger.error("虎扑清除redis错误" + str(e))
             finally:
                 r.close()
             try:
@@ -114,7 +129,7 @@ def write_to_db(html):
                 for d in es_datas:
                     # 拼接插入数据结构
                     action = {
-                        "_index": "weibo_data",
+                        "_index": "hupu_data",
                         "_source": {
                             "title_text": d[0],
                             "title_keyword": d[1],
@@ -128,30 +143,30 @@ def write_to_db(html):
                     actions.append(action)
                 # 批量插入
                 a = helpers.bulk(es, actions)
-                logger.info("weibo数据写入es成功")
+                logger.info("虎扑数据写入es成功")
             except Exception as e:
-                logger.error("weibo数据写入es错误：" + str(e))
+                logger.error("虎扑数据写入es错误：" + str(e))
         except Exception as e:
             logger.error("写入数据库错误:" + str(e))
             db.rollback()
-            with open("../data/weibo_hot_list.txt", "a", encoding="utf-8") as f:
+            with open("../data/hupu_hot_list.txt", "a", encoding="utf-8") as f:
                 for data in date:
                     data = [str(x) for x in data]
                     f.writelines("\t".join(data) + "\n")
-            logger.info("微博热榜写入文件完成")
+            logger.info("虎扑热榜写入文件完成")
         finally:
             db.close()
     except Exception as e:
         logger.error("连接数据失败:" + str(e))
-        with open("../data/weibo_hot_list.txt", "a", encoding="utf-8") as f:
+        with open("../data/hupu_hot_list.txt", "a", encoding="utf-8") as f:
             for data in date:
                 data = [str(x) for x in data]
                 f.writelines("\t".join(data) + "\n")
-        logger.info("微博热榜写入文件完成")
+        logger.info("虎扑热榜写入文件完成")
 
 
 def write_hot_list_to_db():
-    url = 'http://s.weibo.com/top/summary?cate=realtimehot'
+    url = 'https://bbs.hupu.com/all-gambia'
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) '
                              'Chrome/63.0.3239.132 Safari/537.36'}
     html = get_html(url, headers)
